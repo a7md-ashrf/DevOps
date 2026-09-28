@@ -15,7 +15,11 @@
 #   VPS_USER        e.g. deploy          (must be in the docker group)
 #   VPS_SSH_KEY     private key (PEM, full body incl. BEGIN/END lines)
 #   VPS_PORT        optional, default 22
-#   VPS_KNOWN_HOSTS optional, from: ssh-keyscan -p 22 <host>  (recommended)
+#   VPS_KNOWN_HOSTS REQUIRED. Output of `ssh-keyscan -p 22 <host>`, stored
+#                   verbatim. There is deliberately NO ssh-keyscan fallback in
+#                   this workflow: trust-on-first-use on the job that holds the
+#                   production key is a MITM window, so a missing secret is a
+#                   hard failure rather than a warning.
 # Required repository variable (not secret):
 #   VPS_DEPLOY_DIR  default /srv/devops-reference
 # =============================================================================
@@ -54,6 +58,9 @@ jobs:
   deploy:
     name: deploy to production
     runs-on: ubuntu-latest
+    # Approval can sit in "Waiting" for hours, but that does not consume runner
+    # time — this cap covers only execution: pull + up + health gate + logs.
+    timeout-minutes: 30
     environment: production # <- manual approval gate lives here
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -64,7 +71,10 @@ jobs:
       # ---- resolve the image tag ------------------------------------------
       - name: Download tag from Release artifact
         if: github.event_name == 'workflow_run'
-        uses: actions/download-artifact@v4
+        # v4 of this action requires `run-id` + `github-token` to read an
+        # artifact from a DIFFERENT workflow run; without them it can only see
+        # the current run's artifacts and fails with "not found".
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: image-tag
           run-id: ${{ github.event.workflow_run.id }}
@@ -73,15 +83,39 @@ jobs:
 
       - name: Resolve IMAGE_TAG
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            # ---- superseded-release backstop -------------------------------
+            # This job's `concurrency` has cancel-in-progress: false on
+            # purpose (killing a half-finished deploy leaves inconsistent
+            # containers with no health-gate verdict). The side effect is that
+            # two successful Releases produce two Deploys that QUEUE rather than
+            # dedupe. If the newer Release finished first, the older Deploy runs
+            # LAST and silently rolls production backwards.
+            #
+            # release.yml's own `concurrency` group prevents that at the source.
+            # This check is the backstop: it asks the API "is the newest
+            # successful Release on main actually me?" and no-ops if not.
+            RUN_ID="${{ github.event.workflow_run.id }}"
+            LATEST_RUN_ID="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?branch=main&status=success&per_page=1" \
+              --jq '.workflow_runs[0].id')"
+            if [ "$LATEST_RUN_ID" != "$RUN_ID" ]; then
+              echo "DEPLOY_SKIP=true" >> "$GITHUB_ENV"
+              echo "IMAGE_TAG=" >> "$GITHUB_ENV"
+              echo "::notice::Release run ${RUN_ID} is superseded by run ${LATEST_RUN_ID} — nothing to deploy."
+              exit 0
+            fi
             TAG="$(cat "${{ runner.temp }}/release/image-tag.txt")"
           else
             TAG="${{ inputs.image_tag }}"
           fi
           echo "IMAGE_TAG=${TAG}" >> "$GITHUB_ENV"
           echo "Deploying IMAGE_TAG=${TAG:-<rollback / .env pin>}"
+          echo "| image tag | \`${TAG:-<none>}\` |" >> "$GITHUB_STEP_SUMMARY"
 
       # ---- secrets + ssh setup --------------------------------------------
       - name: Require VPS secrets
@@ -107,16 +141,27 @@ jobs:
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$VPS_KEY" > ~/.ssh/vps_key
           chmod 600 ~/.ssh/vps_key
-          if [ -n "$VPS_KNOWN_HOSTS" ]; then
-            printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          else
-            echo "::warning::VPS_KNOWN_HOSTS not set - trusting key via ssh-keyscan (TOFU). Prefer storing the output of 'ssh-keyscan <host>'."
-            ssh-keyscan -p "${VPS_PORT:-22}" "$VPS_HOST" > ~/.ssh/known_hosts 2>/dev/null || true
+          # Fail closed. An earlier version fell back to `ssh-keyscan` here,
+          # which is trust-on-first-use: it records whatever answers the port at
+          # deploy time, so anyone who can MITM that first connection (DNS
+          # hijack, poisoned route, compromised network) silently becomes the
+          # host we hand the production key to. That is the wrong default for
+          # the one job in the whole pipeline that holds a deploy credential.
+          # Pin the host key once, out of band, and store the output.
+          if [ -z "$VPS_KNOWN_HOSTS" ]; then
+            echo "::error::VPS_KNOWN_HOSTS is not set — refusing to deploy to an unverified host."
+            echo "Generate it once from a trusted network, then save it as a repository secret:"
+            echo "  ssh-keyscan -p ${VPS_PORT:-22} ${VPS_HOST} > known_hosts"
+            echo "  # verify the fingerprint out of band, then:"
+            echo "  gh secret set VPS_KNOWN_HOSTS < known_hosts"
+            exit 1
           fi
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
       # ---- the actual deploy ----------------------------------------------
       - name: Run deploy.sh on the VPS
+        if: env.DEPLOY_SKIP != 'true'
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
@@ -137,7 +182,7 @@ jobs:
 
       # ---- failure triage (best effort, never overrides the result) -------
       - name: Collect diagnostics on failure
-        if: failure()
+        if: failure() && env.DEPLOY_SKIP != 'true'
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}

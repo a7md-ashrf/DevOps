@@ -16,6 +16,15 @@
 # Optional Docker Hub mirror: set repository secrets DOCKERHUB_USERNAME and
 # DOCKERHUB_TOKEN — the `mirror` job then retags and pushes the SAME images
 # (no rebuild: layers are already in GHCR).
+#
+# Also produced per image: an SBOM and a build provenance attestation, plus OCI
+# labels. These are attached to the image index, so `docker pull` and the
+# tag-pinned deploy path are unaffected — but note the pushed manifest becomes
+# an OCI index with attestation manifests rather than a single image manifest.
+#
+# A `concurrency` group with cancel-in-progress keeps fast successive pushes to
+# main from deploying out of order. See the block at the bottom of this header
+# for why it is not optional.
 # =============================================================================
 name: Release
 
@@ -31,78 +40,167 @@ permissions:
   contents: read
   packages: write
 
-env:
-  IMAGE_BASE: ghcr.io/${{ github.repository_owner }}/devops-reference
+# WHY THIS BLOCK IS LOAD-BEARING — read it before deleting it.
+# Two pushes to main in quick succession start two Release runs. deploy.yml
+# deliberately does NOT cancel in progress, so both Releases that succeed
+# produce a Deploy run, and those queue rather than dedupe. If the NEWER
+# Release happens to finish first, its Deploy is created first — and the
+# OLDER Deploy then runs last, quietly rolling production back to stale code
+# with a completely green pipeline.
+#
+# Cancelling the superseded Release fixes the ordering at the source: a
+# cancelled run has conclusion != 'success', which deploy.yml's `if:` already
+# rejects. `cancel-in-progress: true` is safe here (unlike in deploy.yml)
+# because nothing has been deployed yet — a partially-pushed image is garbage,
+# not a broken production.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     name: build + push images
     runs-on: ubuntu-latest
+    # A build that cannot finish in 25 minutes is broken, not slow. Without an
+    # explicit cap a hung registry pull or a wedged buildkit daemon burns the
+    # default 6-hour runner slot.
+    timeout-minutes: 25
     outputs:
       image_tag: ${{ steps.tag.outputs.image_tag }}
     steps:
-      - uses: actions/checkout@v4
+      # =====================================================================
+      # Every third-party action is pinned to a full commit SHA, never a tag.
+      #
+      # WHY: `@v3` is a MUTABLE ref. Whoever controls that repository can
+      # repoint it at any commit, and this workflow hands them
+      # `permissions: packages: write` — i.e. the ability to publish whatever
+      # bytes they like to the images production pulls. Pinning the SHA means
+      # the only way to change what runs is to change THIS file, in a review.
+      # The trailing `# vX.Y.Z` comment is how Dependabot (and humans) find
+      # the newer version to move to.
+      # =====================================================================
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute image tag
+      - name: Resolve image coordinates
         id: tag
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
+          set -euo pipefail
           SHORT="${GITHUB_SHA::7}"
-          echo "image_tag=sha-${SHORT}" >> "$GITHUB_OUTPUT"
-          echo "## Release sha-${SHORT}" >> "$GITHUB_STEP_SUMMARY"
+          IMAGE_TAG="sha-${SHORT}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+          # GHCR requires a fully lowercase repository path. `github.repository_owner`
+          # preserves whatever casing the account was created with, so an owner
+          # whose login contains capitals produces an invalid image reference and
+          # the build fails at PUSH time — long after the expensive part is done.
+          # GitHub expressions have no toLower(), so normalise in the shell.
+          IMAGE_BASE="ghcr.io/$(tr '[:upper:]' '[:lower:]' <<< "$REPO_OWNER")/devops-reference"
+          # $GITHUB_ENV overrides workflow-level `env:` for every LATER step in
+          # THIS job only — it does not cross job boundaries, which is why the
+          # mirror job below resolves its own copy.
+          echo "IMAGE_BASE=${IMAGE_BASE}" >> "$GITHUB_ENV"
+
+          # OCI image labels, emitted once here and reused by all four builds via
+          # `labels: ${{ steps.tag.outputs.labels }}`. The `<<EOF` ... `EOF`
+          # heredoc form is the GitHub Actions idiom for a MULTI-LINE step output;
+          # a plain `echo labels="a=$1" >> $GITHUB_OUTPUT` cannot hold newlines.
+          {
+            echo 'labels<<OCI_EOF'
+            echo 'org.opencontainers.image.title=devops-reference'
+            echo "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+            echo "org.opencontainers.image.revision=${GITHUB_SHA}"
+            echo "org.opencontainers.image.version=${IMAGE_TAG}"
+            echo 'org.opencontainers.image.vendor=devops-reference'
+            echo 'OCI_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Release \`${IMAGE_TAG}\`"
+            echo
+            echo "\`${IMAGE_BASE}:${IMAGE_TAG}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build + push backend (runtime stage)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: backend
           target: runtime
           push: true
           tags: ${{ env.IMAGE_BASE }}/backend:${{ steps.tag.outputs.image_tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          labels: ${{ steps.tag.outputs.labels }}
+          # WHY A PER-IMAGE scope: with no `scope=`, every buildx `type=gha`
+          # exporter in a job writes to the same default key ("buildkit"). Docker's
+          # own docs: "If you build multiple images, each build will overwrite the
+          # cache of the previous, leaving only the final cache." So the four
+          # builds below would each destroy the previous one's cache and only the
+          # last (nginx) would survive to warm the next run. One scope per image.
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+          # SBOM + provenance are attestations attached to the image index, not
+          # extra layers — free at rest, and they are what makes `docker inspect`
+          # answer "where did this come from" later.
+          sbom: true
+          provenance: mode=max
 
       - name: Build + push frontend (static origin)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: frontend
           file: frontend/Dockerfile.static
           push: true
           tags: ${{ env.IMAGE_BASE }}/frontend-static:${{ steps.tag.outputs.image_tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          labels: ${{ steps.tag.outputs.labels }}
+          # Separate scope: the two frontend images share a build stage and a
+          # package-lock, but they are different Dockerfiles with different final
+          # stages. Sharing a scope would let one clobber the other.
+          cache-from: type=gha,scope=frontend-static
+          cache-to: type=gha,mode=max,scope=frontend-static
+          sbom: true
+          provenance: mode=max
 
       - name: Build + push frontend (server origin)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: frontend
           file: frontend/Dockerfile.server
           push: true
           tags: ${{ env.IMAGE_BASE }}/frontend-server:${{ steps.tag.outputs.image_tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          labels: ${{ steps.tag.outputs.labels }}
+          cache-from: type=gha,scope=frontend-server
+          cache-to: type=gha,mode=max,scope=frontend-server
+          sbom: true
+          provenance: mode=max
 
       - name: Build + push edge nginx (custom build)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: nginx
           push: true
           tags: ${{ env.IMAGE_BASE }}/nginx:${{ steps.tag.outputs.image_tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          labels: ${{ steps.tag.outputs.labels }}
+          # This one compiles ngx_brotli from source, so its cache layers are by
+          # far the most expensive to rebuild — a dedicated scope matters most here.
+          cache-from: type=gha,scope=nginx
+          cache-to: type=gha,mode=max,scope=nginx
+          sbom: true
+          provenance: mode=max
 
       - name: Export tag for the deploy workflow
         run: echo "${{ steps.tag.outputs.image_tag }}" > image-tag.txt
 
       - name: Upload image-tag artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: image-tag
           path: image-tag.txt
@@ -112,6 +210,7 @@ jobs:
     name: mirror to Docker Hub
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # secrets can't be used in `if:` — expose via env first (step-level gate).
     env:
       HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
@@ -120,9 +219,22 @@ jobs:
         if: env.HAS_DOCKERHUB != 'true'
         run: echo "DOCKERHUB_USERNAME/TOKEN not set — skipping mirror." >> "$GITHUB_STEP_SUMMARY"
 
+      # Runs even when the mirror is skipped: the step-summary line above must be
+      # the last thing that happens, not a hard early exit.
+      - name: Resolve image coordinates
+        if: env.HAS_DOCKERHUB == 'true'
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # Repeated on purpose — the build job's $GITHUB_ENV write does not reach
+          # this job, and an undefined IMAGE_BASE here would silently retag to
+          # "…/backend:sha-…" (no registry) instead of erroring.
+          echo "IMAGE_BASE=ghcr.io/$(tr '[:upper:]' '[:lower:]' <<< "$REPO_OWNER")/devops-reference" >> "$GITHUB_ENV"
+
       - name: Log in to GHCR (pull source)
         if: env.HAS_DOCKERHUB == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -130,7 +242,7 @@ jobs:
 
       - name: Log in to Docker Hub
         if: env.HAS_DOCKERHUB == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

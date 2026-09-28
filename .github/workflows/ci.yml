@@ -8,6 +8,9 @@
 #   frontend — lint, typecheck, tests, production build
 #   compose  — `make validate` merges every compose combination
 #              (dev/prod x static/server) plus shell syntax checks
+#   images   — `docker buildx build --check` lints the four Dockerfiles that
+#              release.yml builds, so a bad `target:` or a typo fails HERE
+#              instead of on main in the run that pushes to the registry
 #
 # Image building/pushing lives in release.yml, gated on main being green via
 # branch protection: PR -> CI required -> merge -> Release -> approve -> Deploy.
@@ -31,6 +34,7 @@ jobs:
   backend:
     name: backend (lint, typecheck, test, build)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: backend
@@ -52,9 +56,13 @@ jobs:
       # test-db-url.ts derives appdb_test from this and creates it on the fly.
       DATABASE_URL: postgresql://app:app@127.0.0.1:5432/appdb
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.5.0
         with:
+          # NOTE: `defaults.run.working-directory` above applies to `run:` steps
+          # ONLY — it does not rewrite `with:` inputs. So this path is resolved
+          # from the repository root (where .nvmrc lives), not from backend/.
+          # Writing `backend/.nvmrc` here is the classic silent mistake.
           node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: backend/package-lock.json
@@ -64,29 +72,66 @@ jobs:
         run: npm run lint
       - name: Typecheck
         run: npm run typecheck
-      - name: Test (fails if anything skipped)
+      - name: Test (fails if anything was skipped)
         shell: bash
         run: |
           set -euo pipefail
-          npm run test 2>&1 | tee /tmp/vitest-backend.log
-          # global-setup.ts SKIPS DB suites when Postgres is unreachable —
-          # that must never count as success in CI.
-          if grep -qE '\| [0-9]+ skipped' /tmp/vitest-backend.log; then
-            echo "::error::Some tests were skipped — the PostgreSQL service is not reachable."
-            exit 1
-          fi
+          # global-setup.ts SKIPS the DB-backed suites when Postgres is
+          # unreachable. That is the right behaviour locally, but in CI it
+          # means a broken service container produces a green build with zero
+          # integration coverage — so a skip has to be a failure here.
+          #
+          # We assert on vitest's JSON report rather than grepping the human
+          # summary. The summary is formatted (and ANSI-colourised) output:
+          #   * any change to its layout breaks the pattern, and
+          #   * if anything colourises when stdout is not a TTY, the escape
+          #     codes land between "| " and the number and the grep goes quiet
+          #     while still exiting 0.
+          # Machine-readable output cannot do either.
+          #
+          # `--outputFile.json=...` is vitest's per-reporter output syntax, so
+          # the human summary AND the JSON report come from one test run.
+          # (a non-zero vitest exit still fails the step via `set -e`.)
+          npm run test -- \
+            --reporter=default \
+            --reporter=json \
+            --outputFile.json=/tmp/vitest-backend.json
+
+          python3 - <<'PY'
+          import json, sys
+
+          with open('/tmp/vitest-backend.json') as fh:
+              report = json.load(fh)
+
+          skipped = report['numPendingTests'] + report['numTodoTests']
+          print(
+              f"tests: {report['numPassedTests']} passed, "
+              f"{report['numFailedTests']} failed, {skipped} skipped, "
+              f"{report['numTotalTests']} total"
+          )
+          if skipped:
+              # A test in state skip/pending is what `describe.runIf(dbReachable)`
+              # produces, so this message points at the actual cause.
+              print(
+                  f"::error::{skipped} test(s) were skipped — the PostgreSQL "
+                  "service is not reachable, so this run proves nothing.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          PY
       - name: Build
         run: npm run build
 
   frontend:
     name: frontend (lint, typecheck, test, build)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -103,8 +148,9 @@ jobs:
   compose:
     name: compose config + shell syntax
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
       - name: Prepare .env
         run: cp .env.example .env
       - name: Validate every compose combination
@@ -118,3 +164,44 @@ jobs:
           sh -n nginx/docker-entrypoint.d/45-site-config.sh && echo "ok sh    nginx entrypoint"
       - name: Makefile parses (renders every documented target)
         run: make help > /dev/null && echo "ok make"
+
+  images:
+    name: dockerfiles (build check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build-check every image release.yml produces
+        run: |
+          set -euo pipefail
+          # `docker buildx build --check` runs the Dockerfile frontend's linter
+          # instead of executing any layer: it parses the file, resolves the
+          # requested --target stage, and reports unused stages, undefined
+          # build args and secrets baked into ARGs. Seconds, not minutes.
+          #
+          # WHY THIS JOB EXISTS: release.yml only runs on main. A typo in a
+          # Dockerfile or a `target:` that no longer exists is therefore
+          # discovered AFTER the merge, in the job that holds
+          # `packages: write`. This moves that failure back to the PR.
+          #
+          # WHAT IT DOES NOT DO — do not let the comment above oversell it:
+          # it does not execute a single RUN, so it will not catch a COPY of a
+          # missing file, a failing `npm ci`, or a broken nginx template. Those
+          # still surface in release.yml.
+          check() {
+            echo "::group::$1"
+            shift
+            docker buildx build --check "$@" .
+            echo
+          }
+
+          check "backend (target: runtime)" \
+            --file backend/Dockerfile --target runtime
+          check "frontend (static)" \
+            --file frontend/Dockerfile.static
+          check "frontend (server)" \
+            --file frontend/Dockerfile.server
+          check "nginx" \
+            --file nginx/Dockerfile
