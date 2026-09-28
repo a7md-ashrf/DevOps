@@ -1,6 +1,13 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { register } from 'tsx/esm/api';
+// The CJS hook, NOT `tsx/esm/api`. node-pg-migrate loads each migration with
+//   createRequire(resolve('_'))(filePath)
+// i.e. CommonJS `require()`, inside a try/catch that rethrows as
+//   "Can't get migration files: <stack>"
+// An ESM loader hook cannot intercept a CJS require, so registering the esm
+// variant leaves the .ts migrations unparseable. `tsx/cjs/api` installs
+// require.extensions hooks, which is the one this call path goes through.
+import { register as registerCjsLoader } from 'tsx/cjs/api';
 import { runner as migrationRunner } from 'node-pg-migrate';
 
 export type MigrationDirection = 'up' | 'down';
@@ -26,27 +33,27 @@ let loaderRegistered = false;
 /**
  * Register a TypeScript loader for the CURRENT process, once.
  *
- * WHY THIS IS NOT OPTIONAL: `migrations/*.ts` is loaded by node-pg-migrate via
- * a dynamic `import()` of the file path. A dynamic import goes through Node's
- * own ESM resolver, NOT through whichever tool started this process, so the
- * `.ts` files only load if EITHER
- *   (a) the ambient Node can strip types itself — true on Node >= 22.18 / 23+,
- *       false on Node 20 — or
- *   (b) a TS loader is registered as a global ESM hook.
+ * WHY THIS IS NOT OPTIONAL: `migrations/*.ts` is loaded by node-pg-migrate with
+ * a CJS `require()` of the file path. `require()` only understands `.ts` if a
+ * loader has extended `require.extensions`, which means the code's behaviour
+ * silently depends on whether the ambient process happens to have one already
+ * registered:
+ *   * `npm run migrate` runs under the tsx CLI, which registers one — works.
+ *   * the vitest global setup does NOT — so the require fell through to
+ *     Node's plain CJS loader, which cannot parse TypeScript.
+ * On a modern Node the resulting error is masked, because Node >= 22.18 /
+ * 23+ strips types itself; on the Node 20 that .nvmrc pins it is not masked:
+ *   Can't get migration files: SyntaxError: Unexpected identifier
+ *   'MigrationBuilder'
+ * That is why this only ever failed in CI and never on a recent dev machine.
  *
- * Without this call the behaviour silently depends on the Node version, which
- * is how migrations broke in CI: .nvmrc pins Node 20, a developer on Node 24
- * never saw it, and every DB-backed test failed with
- *   SyntaxError: Unexpected identifier 'MigrationBuilder'
- * Registering here makes the code path identical on every Node — which is what
- * the comment below always claimed, and what the callers
- * (scripts/migrate.ts, test/global-setup.ts) both depend on.
- *
- * It is idempotent and a no-op when tsx already started the process.
+ * Registering here makes the code path identical on every Node and under every
+ * caller — which is what the comment on runMigrations has always claimed.
+ * Idempotent, and a no-op when tsx is already the loader.
  */
 function ensureTypeScriptLoader(): void {
   if (loaderRegistered) return;
-  register();
+  registerCjsLoader();
   loaderRegistered = true;
 }
 
