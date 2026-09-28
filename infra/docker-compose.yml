@@ -1,0 +1,197 @@
+# =============================================================================
+# devops-reference — base Compose file (local development + topology reference)
+#
+# Invocation (the Makefile wraps this — run from the REPO ROOT):
+#   docker compose --env-file .env -f infra/docker-compose.yml up -d
+#
+# WHY an explicit --env-file: Compose's implicit .env lookup depends on which
+# directory you happen to be in. Passing it makes the command reproducible and
+# matches infra/deploy/deploy.sh exactly.
+#
+# Path semantics: build contexts and bind mounts are relative to THIS file's
+# directory (infra/), hence ../backend etc.
+#
+# Service graph:
+#   db (healthy) -> migrate (exits 0) -> backend -> nginx <- frontend
+#
+# Production merges docker-compose.prod.yml over this file; every difference
+# (registry images, closed ports, restart/resource policy, TLS mounts) lives
+# there and nowhere else.
+# =============================================================================
+
+# Reusable logging policy: rotate container logs inside Docker so no container
+# can ever fill the host disk. Anchors work in Compose; every service opts in.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER missing - run 'make setup'}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD missing - edit .env}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB missing - edit .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Dev convenience only: GUI clients / host-run tools can reach the DB.
+    # The production override REMOVES this port entirely (!reset) — in prod the
+    # database is reachable exclusively on the internal backend_net.
+    ports:
+      - "${POSTGRES_HOST_PORT:-127.0.0.1:5432}:5432"
+    healthcheck:
+      # $$ escapes the $ so the shell INSIDE the container expands the env
+      # vars (otherwise Compose would try to interpolate them itself).
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    logging: *default-logging
+    networks:
+      - backend_net
+
+  # One-shot: applies migrations and exits. `service_completed_successfully`
+  # makes the backend wait for a GREEN migration — schema is always correct
+  # before new code starts, on first deploy and every deploy after.
+  migrate:
+    build:
+      context: ../backend
+      # Same image as the backend service in dev (dev target ships tsx, which
+      # runs the TypeScript migrations); production reuses the runtime image.
+      target: dev
+    image: ${IMAGE_REPO:-local}/backend:${IMAGE_TAG:-dev}
+    command: ["npm", "run", "migrate"]
+    restart: "no"
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    depends_on:
+      db:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - backend_net
+
+  backend:
+    build:
+      context: ../backend
+      target: dev # tsx watch = hot reload when source is bind-mounted below
+    image: ${IMAGE_REPO:-local}/backend:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development # production override flips this
+      PORT: "3000"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-pretty} # production override forces json
+      APP_VERSION: ${IMAGE_TAG:-dev}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      # The stack ALWAYS has Nginx in front of the API, so trusting exactly
+      # one proxy hop keeps rate limiting keyed to real client IPs (see
+      # backend/src/config.ts). In the `make dev` host workflow this variable
+      # is absent and the API trusts nobody — also correct.
+      TRUST_PROXY: "1"
+    # Host-side convenience binding; removed in production.
+    ports:
+      - "${BACKEND_HOST_PORT:-127.0.0.1:3000}:3000"
+    # Hot-reload mounts. Deliberately NOT mounting node_modules: the image
+    # contains the linux/musl build from `npm ci`, and letting the host's
+    # (macOS/arm64) node_modules shadow it is the classic "works on my
+    # machine" breakage.
+    volumes:
+      - ../backend/src:/app/src
+      - ../backend/scripts:/app/scripts
+      - ../backend/migrations:/app/migrations
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging: *default-logging
+    networks:
+      - frontend_net
+      - backend_net
+
+  # The FRONTEND_MODE flag in .env selects Dockerfile.static or
+  # Dockerfile.server — the single switch that changes the whole topology of
+  # the UI tier (docs/frontend-modes.md).
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile.${FRONTEND_MODE:-static}
+    # Image name carries the mode so both variants can coexist locally and be
+    # tagged separately in the registry.
+    image: ${IMAGE_REPO:-local}/frontend-${FRONTEND_MODE:-static}:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "8080" # consumed by server mode; static mode ignores it
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    logging: *default-logging
+    networks:
+      - frontend_net
+
+  nginx:
+    build: ../nginx
+    image: ${IMAGE_REPO:-local}/nginx:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+      - "${HTTPS_PORT:-8443}:8443"
+    environment:
+      # One flag drives everything: which template to render and which origin
+      # to expect behind `location /`.
+      NGINX_MODE: ${FRONTEND_MODE:-static}
+      DOMAIN: ${DOMAIN:-localhost}
+      # 0 in development: the entrypoint self-signs for the 443 block and the
+      # HTTP port proxies the app directly (no redirect loop, no browser
+      # warnings). Production sets 1 after the first certificate exists.
+      ENABLE_TLS_REDIRECT: ${ENABLE_TLS_REDIRECT:-0}
+      # TLS_CERT / TLS_KEY are intentionally UNSET here — the entrypoint then
+      # falls back to its generated dev pair. Production sets the
+      # /etc/letsencrypt/live/<domain>/... paths.
+    volumes:
+      # ACME HTTP-01 webroot, shared with the host where certbot runs
+      # (infra/setup/issue-ssl.sh). Read-only: Nginx only ever serves from it.
+      - ../certbot/www:/var/www/certbot:ro
+    depends_on:
+      frontend:
+        condition: service_started
+      backend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    logging: *default-logging
+    networks:
+      - frontend_net
+
+# Network segmentation:
+#   frontend_net — request path (nginx <-> frontend, nginx <-> backend)
+#   backend_net  — data path (backend <-> db)
+# The database is NOT on frontend_net: even a full edge compromise cannot
+# open a raw connection to PostgreSQL without jumping onto backend_net first.
+networks:
+  frontend_net:
+  backend_net:
+
+volumes:
+  pgdata:

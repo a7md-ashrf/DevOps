@@ -1,0 +1,109 @@
+# =============================================================================
+# devops-reference — PRODUCTION overlay
+#
+# Merge over the base file (the deploy script and Makefile both do this):
+#   docker compose --env-file .env -f infra/docker-compose.yml \
+#                  -f infra/docker-compose.prod.yml up -d
+#
+# Rules for this file:
+#   * Anything that differs in production lives HERE, never in the base file.
+#   * `!reset` REPLACES a list instead of merging it (Compose >= 2.24). Port
+#     and volume mappings must be REPLACED — merging would keep the dev-only
+#     published ports and source-code bind mounts alive in production.
+#   * Images come from the registry (GHCR canonical, Docker Hub mirror).
+#     `pull_policy: always` guarantees `up` never falls back to a local build,
+#     even if someone runs the command by hand without `pull` first.
+# =============================================================================
+
+services:
+  db:
+    # 5432 must NOT be published in production — the DB is reachable only on
+    # the internal backend_net. Compose merges port mappings, so we reset the
+    # list rather than add to it.
+    ports: !reset []
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768m
+    security_opt:
+      - no-new-privileges:true
+    pull_policy: always
+
+  migrate:
+    # Built target in the base is `dev`; in production the SAME runtime image
+    # the backend runs is used (deploy pulls it before `up`).
+    pull_policy: always
+    security_opt:
+      - no-new-privileges:true
+
+  backend:
+    # No published port: traffic only ever enters via Nginx (frontend_net).
+    ports: !reset []
+    # Remove the dev hot-reload source mounts — the image already contains
+    # the built application; editing source on the server is never the path.
+    volumes: !reset []
+    environment:
+      NODE_ENV: production
+      LOG_FORMAT: json
+      APP_VERSION: ${IMAGE_TAG:-latest}
+    # Give graceful shutdown room before SIGKILL (pino flush + in-flight
+    # requests + pg pool drain — see backend/src/index.ts).
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+    security_opt:
+      - no-new-privileges:true
+    # Node needs no Linux capabilities: it binds :3000 (>1024) and only ever
+    # touches files it owns. Dropping ALL is cheap insurance.
+    cap_drop:
+      - ALL
+    init: true
+    pull_policy: always
+
+  frontend:
+    environment:
+      NODE_ENV: production
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    pull_policy: always
+
+  nginx:
+    # Publish the real public ports. Base file binds 8080/8443 for dev —
+    # reset, then replace with 80/443.
+    ports: !reset
+      - "80:8080"
+      - "443:8443"
+    environment:
+      # Point at the Let's Encrypt pair (missing files trigger the
+      # entrypoint's self-signed fallback only in dev — on the VPS the
+      # issue-ssl.sh step runs BEFORE first `up`).
+      TLS_CERT: /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
+      TLS_KEY: /etc/letsencrypt/live/${DOMAIN}/privkey.pem
+      # Redirect HTTP -> HTTPS in production (ACME challenges still answer on
+      # port 80 via the /.well-known location — see nginx template).
+      ENABLE_TLS_REDIRECT: ${ENABLE_TLS_REDIRECT:-1}
+    volumes:
+      # Merge semantics for volumes are keyed by target path: the dev webroot
+      # mount from the base file survives, this adds the certificate tree.
+      - ../certbot/letsencrypt:/etc/letsencrypt:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128m
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    pull_policy: always

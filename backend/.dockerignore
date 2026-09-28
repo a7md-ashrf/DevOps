@@ -1,0 +1,6 @@
+# Keep the build context minimal and never leak local state into the image.
+node_modules
+dist
+coverage
+.env
+*.log

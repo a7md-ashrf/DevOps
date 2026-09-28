@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# FRONTEND — SERVER MODE
+# Serves the SAME React build from a small Node/Express process.
+#
+#   deps     — npm ci (full toolchain for the vite build)
+#   build    — typecheck + vite build -> dist/
+#   runtime  — production deps (express) + server.mjs + dist/, non-root
+#
+# Choose this mode when you need a Node runtime in the request path: SSR,
+# per-request personalization, WebSockets, or an API co-located with the UI.
+# Tradeoffs vs static mode: docs/frontend-modes.md
+# =============================================================================
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
+
+FROM deps AS build
+COPY . .
+RUN npm run build
+
+FROM node:20-alpine AS runtime
+ENV NODE_ENV=production \
+    PORT=8080
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev && npm cache clean --force
+
+COPY server.mjs ./
+COPY --from=build /app/dist ./dist
+
+USER node
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD wget -q -O /dev/null "http://127.0.0.1:${PORT}/healthz" || exit 1
+
+CMD ["node", "server.mjs"]

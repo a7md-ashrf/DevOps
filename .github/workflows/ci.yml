@@ -1,0 +1,120 @@
+# =============================================================================
+# CI — quality gates. Runs on every PR and on pushes to main.
+#
+# Jobs:
+#   backend  — lint, typecheck, tests (against a real PostgreSQL service
+#              container; the run FAILS if any test got skipped, so a dead
+#              database can never masquerade as a green build), build
+#   frontend — lint, typecheck, tests, production build
+#   compose  — `make validate` merges every compose combination
+#              (dev/prod x static/server) plus shell syntax checks
+#
+# Image building/pushing lives in release.yml, gated on main being green via
+# branch protection: PR -> CI required -> merge -> Release -> approve -> Deploy.
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: backend (lint, typecheck, test, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: appdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d appdb"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    env:
+      # test-db-url.ts derives appdb_test from this and creates it on the fly.
+      DATABASE_URL: postgresql://app:app@127.0.0.1:5432/appdb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint (ESLint + Prettier)
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test (fails if anything skipped)
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run test 2>&1 | tee /tmp/vitest-backend.log
+          # global-setup.ts SKIPS DB suites when Postgres is unreachable —
+          # that must never count as success in CI.
+          if grep -qE '\| [0-9]+ skipped' /tmp/vitest-backend.log; then
+            echo "::error::Some tests were skipped — the PostgreSQL service is not reachable."
+            exit 1
+          fi
+      - name: Build
+        run: npm run build
+
+  frontend:
+    name: frontend (lint, typecheck, test, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint (ESLint + Prettier)
+        run: npm run lint
+      - name: Test
+        run: npm run test
+      - name: Build (typecheck + vite build)
+        run: npm run build
+
+  compose:
+    name: compose config + shell syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare .env
+        run: cp .env.example .env
+      - name: Validate every compose combination
+        run: make validate
+      - name: Shell syntax check
+        run: |
+          set -euo pipefail
+          for f in infra/setup/*.sh infra/backup/*.sh infra/deploy/*.sh; do
+            bash -n "$f" && echo "ok bash  $f"
+          done
+          sh -n nginx/docker-entrypoint.d/45-site-config.sh && echo "ok sh    nginx entrypoint"
+      - name: Makefile parses (renders every documented target)
+        run: make help > /dev/null && echo "ok make"

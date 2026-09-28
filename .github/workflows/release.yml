@@ -1,0 +1,151 @@
+# =============================================================================
+# Release — build & push all four production images on every push to main.
+#
+# Tags:  sha-<shortsha>   (immutable, what deploy.sh pins to)
+#   ghcr.io/<owner>/devops-reference/backend
+#   ghcr.io/<owner>/devops-reference/frontend-static
+#   ghcr.io/<owner>/devops-reference/frontend-server
+#   ghcr.io/<owner>/devops-reference/nginx
+#
+# Both frontend variants are built regardless of FRONTEND_MODE — the mode is a
+# VPS-side switch (.env), so switching modes must never require a rebuild.
+#
+# The exact tag is written to the `image-tag` artifact, which deploy.yml picks
+# up after manual approval (GitHub Environment "production" reviewers).
+#
+# Optional Docker Hub mirror: set repository secrets DOCKERHUB_USERNAME and
+# DOCKERHUB_TOKEN — the `mirror` job then retags and pushes the SAME images
+# (no rebuild: layers are already in GHCR).
+# =============================================================================
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_BASE: ghcr.io/${{ github.repository_owner }}/devops-reference
+
+jobs:
+  build:
+    name: build + push images
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          SHORT="${GITHUB_SHA::7}"
+          echo "image_tag=sha-${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "## Release sha-${SHORT}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build + push backend (runtime stage)
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          target: runtime
+          push: true
+          tags: ${{ env.IMAGE_BASE }}/backend:${{ steps.tag.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build + push frontend (static origin)
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          file: frontend/Dockerfile.static
+          push: true
+          tags: ${{ env.IMAGE_BASE }}/frontend-static:${{ steps.tag.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build + push frontend (server origin)
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          file: frontend/Dockerfile.server
+          push: true
+          tags: ${{ env.IMAGE_BASE }}/frontend-server:${{ steps.tag.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build + push edge nginx (custom build)
+        uses: docker/build-push-action@v6
+        with:
+          context: nginx
+          push: true
+          tags: ${{ env.IMAGE_BASE }}/nginx:${{ steps.tag.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Export tag for the deploy workflow
+        run: echo "${{ steps.tag.outputs.image_tag }}" > image-tag.txt
+
+      - name: Upload image-tag artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-tag
+          path: image-tag.txt
+          retention-days: 30
+
+  mirror:
+    name: mirror to Docker Hub
+    needs: build
+    runs-on: ubuntu-latest
+    # secrets can't be used in `if:` — expose via env first (step-level gate).
+    env:
+      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+    steps:
+      - name: Skip when Docker Hub secrets are absent
+        if: env.HAS_DOCKERHUB != 'true'
+        run: echo "DOCKERHUB_USERNAME/TOKEN not set — skipping mirror." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to GHCR (pull source)
+        if: env.HAS_DOCKERHUB == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: env.HAS_DOCKERHUB == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull, retag, push (no rebuild — same digest on both registries)
+        if: env.HAS_DOCKERHUB == 'true'
+        env:
+          TAG: ${{ needs.build.outputs.image_tag }}
+          DH: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+          for name in backend frontend-static frontend-server nginx; do
+            SRC="${IMAGE_BASE}/${name}:${TAG}"
+            DST="docker.io/${DH}/devops-reference/${name}:${TAG}"
+            docker pull "$SRC"
+            docker tag "$SRC" "$DST"
+            docker push "$DST"
+          done

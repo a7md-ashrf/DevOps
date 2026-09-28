@@ -1,0 +1,62 @@
+# =============================================================================
+# Site configuration — STATIC frontend mode (UI served by an nginx container).
+# Rendered into /etc/nginx/conf.d/10-site.conf by docker-entrypoint.d/45.
+# ${...} values come from the container environment; $... values are Nginx
+# runtime variables (envsubst only substitutes the former — see the script).
+# =============================================================================
+
+# ---- HTTPS -------------------------------------------------------------------
+server {
+    listen 8443 ssl;          # host 443 maps to container 8443 (non-root)
+    http2 on;
+    server_name ${DOMAIN} _;
+
+    # Compose overrides these to the Let's Encrypt paths in production; the
+    # entrypoint falls back to a generated self-signed pair in development so
+    # this block ALWAYS has files to load.
+    ssl_certificate ${TLS_CERT};
+    ssl_certificate_key ${TLS_KEY};
+
+    include /etc/nginx/snippets/tls-hardening.conf;
+    include /etc/nginx/snippets/security-headers.conf;
+
+    limit_req zone=site_limit burst=60 nodelay;
+
+    location = /healthz {
+        access_log off;
+        return 200 "ok\n";
+    }
+
+    include /etc/nginx/snippets/locations-static.conf;
+}
+
+# ---- HTTP --------------------------------------------------------------------
+server {
+    listen 8080;              # host 80 maps to container 8080
+    server_name ${DOMAIN} _;
+
+    include /etc/nginx/snippets/security-headers.conf;
+
+    limit_req zone=site_limit burst=60 nodelay;
+
+    location = /healthz {
+        access_log off;
+        return 200 "ok\n";
+    }
+
+    # ACME HTTP-01 challenges must keep answering on plain HTTP even after the
+    # HTTPS redirect is enabled — certbot revalidation requests hit
+    # http://<domain>/.well-known/acme-challenge/... . This prefix is longer
+    # than the redirect's `location /`, so it always wins.
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        default_type text/plain;
+        access_log off;
+    }
+
+    # Written by the entrypoint at container start (.inc so the http-level
+    # `include conf.d/*.conf` glob does NOT also parse it in the wrong context):
+    #   ENABLE_TLS_REDIRECT=1 -> location / { return 301 https://... }
+    #   ENABLE_TLS_REDIRECT=0 -> include snippets/locations-static.conf
+    include /etc/nginx/conf.d/http-app.inc;
+}

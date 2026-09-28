@@ -1,0 +1,48 @@
+# --- Dependencies -------------------------------------------------------------
+node_modules/
+
+# --- Build output -------------------------------------------------------------
+dist/
+build/
+*.tsbuildinfo
+
+# --- Environment files --------------------------------------------------------
+# Real values NEVER enter git. Only *.example files are committed.
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# --- Logs ---------------------------------------------------------------------
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Test output --------------------------------------------------------------
+coverage/
+.vitest/
+
+# --- Editor / OS --------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# --- Runtime state produced by infra scripts ----------------------------------
+# Database dumps (never commit customer data)
+backups/
+
+# ACME webroot, issued certificates, renewal state — the private key lives
+# here; *.pem/*.key below are a second net in case anything leaks upward.
+certbot/
+
+# Tag of the last successful deploy (written by infra/deploy/deploy.sh)
+.deploy-last-good
+
+# Certificates and keys of any kind
+*.pem
+*.key
+*.crt
+*.csr
