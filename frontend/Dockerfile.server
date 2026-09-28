@@ -14,7 +14,11 @@
 FROM node:20-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
+# `deps` and `runtime` are sibling stages, so BuildKit runs them in parallel.
+# Without a distinct `id=` per mount they share one npm cache and the two
+# installs corrupt each other (ENOTEMPTY on _cacache, "tarball seems to be
+# corrupted"). Same fix and same reasoning as backend/Dockerfile.
+RUN --mount=type=cache,target=/root/.npm,id=npm-dev \
     npm ci
 
 FROM deps AS build
@@ -27,8 +31,11 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci --omit=dev && npm cache clean --force
+# No `npm cache clean --force`: a cache mount never lands in the image, so
+# cleaning it cannot shrink anything — it can only break a parallel stage.
+# See backend/Dockerfile for the full explanation.
+RUN --mount=type=cache,target=/root/.npm,id=npm-prod \
+    npm ci --omit=dev
 
 COPY server.mjs ./
 COPY --from=build /app/dist ./dist

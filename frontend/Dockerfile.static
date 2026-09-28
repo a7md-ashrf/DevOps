@@ -12,7 +12,11 @@
 FROM node:20-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
+# An explicit `id` even though nothing races here today: the final `static`
+# stage is nginx and runs no npm, so this is the only cache mount in the file.
+# Naming it keeps the pattern uniform across the Dockerfiles and stops the
+# sibling-stage race in backend/Dockerfile from being reintroduced by copy-paste.
+RUN --mount=type=cache,target=/root/.npm,id=npm-dev \
     npm ci
 
 FROM deps AS build

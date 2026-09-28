@@ -21,7 +21,16 @@
 FROM node:20-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
+# `id=` is load-bearing, not decoration. `deps` and `runtime` are SIBLING
+# stages (both start `FROM node:20-alpine`; neither derives from the other), so
+# BuildKit runs them in PARALLEL. With no explicit id, both
+# `--mount=type=cache,target=/root/.npm` resolve to the SAME cache directory,
+# and two concurrent `npm ci` processes then fight over one `_cacache`:
+#   npm error ENOTEMPTY: directory not empty, rmdir '/root/.npm/_cacache/index-v5/6e'
+#   npm warn tarball data for ... seems to be corrupted. Trying again.
+# That second line is the same race — the sibling stage deleted tarballs while
+# this one was reading them. One id per stage; they warm independently.
+RUN --mount=type=cache,target=/root/.npm,id=npm-dev \
     npm ci
 
 FROM deps AS build
@@ -42,8 +51,16 @@ ENV NODE_ENV=production \
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci --omit=dev && npm cache clean --force
+# There is deliberately NO `npm cache clean --force` here. A BuildKit cache
+# mount is not part of the image: everything npm writes to /root/.npm goes into
+# the cache, and the layer that gets committed contains only the original
+# (empty) directory. So cleaning the cache cannot make this image smaller — it
+# can only corrupt a cache that a parallel stage is reading, which is exactly
+# the ENOTEMPTY failure this replaced. It is a habit carried over from
+# Dockerfiles that install WITHOUT a mount, where the cache really does bloat
+# the layer. (If you ever drop the mount, put the clean back.)
+RUN --mount=type=cache,target=/root/.npm,id=npm-prod \
+    npm ci --omit=dev
 
 COPY --from=build /app/dist ./dist
 # Migrations are executed by the compose one-shot `migrate` service from this

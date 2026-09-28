@@ -8,9 +8,10 @@
 #   frontend — lint, typecheck, tests, production build
 #   compose  — `make validate` merges every compose combination
 #              (dev/prod x static/server) plus shell syntax checks
-#   images   — `docker buildx build --check` lints the four Dockerfiles that
-#              release.yml builds, so a bad `target:` or a typo fails HERE
-#              instead of on main in the run that pushes to the registry
+#   images   — lints all four Dockerfiles (`docker buildx build --check`) AND
+#              really builds the three Node ones, using the exact context /
+#              file / target release.yml uses, so a failure inside a RUN is
+#              caught on the PR instead of on main after the merge
 #
 # Image building/pushing lives in release.yml, gated on main being green via
 # branch protection: PR -> CI required -> merge -> Release -> approve -> Deploy.
@@ -166,9 +167,11 @@ jobs:
         run: make help > /dev/null && echo "ok make"
 
   images:
-    name: dockerfiles (build check)
+    name: dockerfiles (check + real build)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Higher than the other jobs on purpose: the builds below are the expensive
+    # part of this workflow, and cutting them off halfway wastes the whole run.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -181,15 +184,8 @@ jobs:
           # requested --target stage, and reports unused stages, undefined
           # build args and secrets baked into ARGs. Seconds, not minutes.
           #
-          # WHY THIS JOB EXISTS: release.yml only runs on main. A typo in a
-          # Dockerfile or a `target:` that no longer exists is therefore
-          # discovered AFTER the merge, in the job that holds
-          # `packages: write`. This moves that failure back to the PR.
-          #
-          # WHAT IT DOES NOT DO — do not let the comment above oversell it:
-          # it does not execute a single RUN, so it will not catch a COPY of a
-          # missing file, a failing `npm ci`, or a broken nginx template. Those
-          # still surface in release.yml.
+          # Cheap and broad: it covers all four images, including nginx, which
+          # the real builds below skip.
           check() {
             echo "::group::$1"
             shift
@@ -205,3 +201,53 @@ jobs:
             --file frontend/Dockerfile.server
           check "nginx" \
             --file nginx/Dockerfile
+
+      # ---- the part that actually executes layers -------------------------
+      # WHY THIS EXISTS: `--check` above executes nothing, so it cannot see a
+      # failure inside a RUN. A real one did: on 2026-09-28 release.yml failed
+      # with
+      #   npm error ENOTEMPTY: directory not empty,
+      #   rmdir '/root/.npm/_cacache/index-v5/6e'
+      # because `deps` and `runtime` are sibling stages that BuildKit builds in
+      # PARALLEL, both mounted the same npm cache, and `runtime` ran
+      # `npm cache clean --force` while `deps` was still writing to it. Every
+      # `--check`-only gate was green while that was broken, and the failure
+      # landed AFTER the merge, in the job holding `packages: write`.
+      #
+      # So: build the three Node images for real, with the EXACT context, file
+      # and target release.yml uses — this is a rehearsal of the release build,
+      # not an approximation of it. Keep the two in sync when either changes.
+      #
+      # nginx is deliberately NOT built here: it compiles ngx_brotli from
+      # source (minutes, and it needs git + a build toolchain), and it is
+      # written to degrade to gzip-only rather than fail. `--check` still
+      # covers it for syntax and target errors.
+      - name: Build backend (runtime) for real
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: backend
+          target: runtime
+          push: false # build and discard; nothing may reach a registry from a PR
+          tags: ci/backend:verify
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build frontend (static) for real
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: frontend
+          file: frontend/Dockerfile.static
+          push: false
+          tags: ci/frontend-static:verify
+          cache-from: type=gha,scope=frontend-static
+          cache-to: type=gha,mode=max,scope=frontend-static
+
+      - name: Build frontend (server) for real
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: frontend
+          file: frontend/Dockerfile.server
+          push: false
+          tags: ci/frontend-server:verify
+          cache-from: type=gha,scope=frontend-server
+          cache-to: type=gha,mode=max,scope=frontend-server
