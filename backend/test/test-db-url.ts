@@ -1,5 +1,19 @@
 import pg from 'pg';
 
+const DEFAULT_URL = 'postgresql://app:app@127.0.0.1:5432/appdb';
+
+/**
+ * The DATABASE_URL exactly as given — the database the app actually talks to.
+ *
+ * Used for the "is the server up?" probe in global-setup. It must NOT be the
+ * derived *_test URL: on a fresh server that database does not exist yet, so
+ * probing it fails, setup returns early, and the test database is then never
+ * created. See global-setup.ts.
+ */
+export function baseDatabaseUrl(baseUrl?: string): string {
+  return new URL(baseUrl ?? process.env.DATABASE_URL ?? DEFAULT_URL).toString();
+}
+
 /**
  * Tests always run against `<dbname>_test`, never the development database —
  * a `TRUNCATE` in a test can never touch dev data. The URL is derived
@@ -7,8 +21,7 @@ import pg from 'pg';
  * cross-process communication.
  */
 export function testDatabaseUrl(baseUrl?: string): string {
-  const base = baseUrl ?? process.env.DATABASE_URL ?? 'postgresql://app:app@127.0.0.1:5432/appdb';
-  const url = new URL(base);
+  const url = new URL(baseDatabaseUrl(baseUrl));
   const dbName = url.pathname.replace(/^\//, '') || 'appdb';
   if (!dbName.endsWith('_test')) {
     url.pathname = `/${dbName}_test`;
